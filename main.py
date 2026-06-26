@@ -17,8 +17,10 @@ app = FastAPI(title="QueueStorm Investigator Copilot")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Initialize client
+api_key = os.getenv("OPENAI_API_KEY")
 client = AsyncOpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),       
+    api_key=api_key,       
     base_url="https://api.groq.com/openai/v1"  
 )
 
@@ -28,7 +30,7 @@ async def health_check():
 
 @app.post("/analyze-ticket", response_model=TicketResponse)
 async def analyze_ticket(request: TicketRequest):
-    # 1. Capture ALL incoming context data so the LLM has complete visibility
+    # 1. Prepare data
     formatted_history = json.dumps([tx.model_dump() for tx in request.transaction_history], indent=2)
     campaign_str = request.campaign_context if request.campaign_context else "None Provided"
     metadata_str = json.dumps(request.metadata) if request.metadata else "None Provided"
@@ -46,10 +48,8 @@ async def analyze_ticket(request: TicketRequest):
     {formatted_history}
     """
 
-    json_instruction = "\n\nCRITICAL: Return ONLY a valid JSON object matching the requested schema. Ensure all Enum strings match perfectly."
-    
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT + json_instruction},
+        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_payload}
     ]
 
@@ -57,21 +57,21 @@ async def analyze_ticket(request: TicketRequest):
     max_attempts = 2
     for attempt in range(max_attempts):
         try:
+            if not api_key:
+                raise ValueError("OPENAI_API_KEY is missing from environment.")
+
             completion = await client.chat.completions.create(
                 model="llama-3.3-70b-versatile", 
                 messages=messages,
                 response_format={"type": "json_object"},
-                temperature=0.0  # Zero temperature ensures deterministic structural output
+                temperature=0.0
             )
             
             raw_json_str = completion.choices[0].message.content.strip()
-            
             if raw_json_str.startswith("```"):
                 raw_json_str = raw_json_str.strip("`").replace("json\n", "", 1)
             
             raw_json_dict = json.loads(raw_json_str)
-            
-            # Match schema structure
             ai_response = TicketResponse(**raw_json_dict)
             
             # 3. Post-processing Guardrails
@@ -98,12 +98,9 @@ async def analyze_ticket(request: TicketRequest):
         except (json.JSONDecodeError, ValidationError) as e:
             logger.warning(f"Attempt {attempt + 1} failed validation: {str(e)}")
             if attempt < max_attempts - 1:
-                # Provide direct error feedback to the model for self-correction
                 messages.append({"role": "assistant", "content": raw_json_str if 'raw_json_str' in locals() else ""})
-                messages.append({"role": "user", "content": f"Your previous output caused a validation error: {str(e)}. Please correct it and output valid JSON matching the schema fields."})
+                messages.append({"role": "user", "content": f"Previous JSON parsing error: {str(e)}. Correct it."})
             else:
-                # 4. Final Fail-Safe: Gracefully fallback with a 200 instead of a 500 error to save points
-                logger.error("All structural parsing attempts exhausted. Deploying graceful fallback.")
                 return TicketResponse(
                     ticket_id=request.ticket_id,
                     relevant_transaction_id=None,
@@ -113,11 +110,12 @@ async def analyze_ticket(request: TicketRequest):
                     department=Department.customer_support,
                     agent_summary="Automated parse error occurred. Ticket shifted to manual routing.",
                     recommended_next_action="Review original log data manually.",
-                    customer_reply="We have successfully logged your inquiry. Our support team is investigating the matter.",
+                    customer_reply="We have received your inquiry and our support team is investigating.",
                     human_review_required=True,
                     confidence=0.5,
                     reason_codes=["system_fallback_active"]
                 )
         except Exception as e:
+            # This catches the "Internal engine fault" but now tells us WHY
             logger.error(f"Unrecoverable error processing ticket {request.ticket_id}: {str(e)}")
-            return JSONResponse(status_code=500, content={"message": "Internal engine fault."})
+            return JSONResponse(status_code=500, content={"message": f"DEBUG_ERROR: {str(e)}"})
